@@ -24,7 +24,7 @@ inline try_harakiri(self, label) {
 
 typedef Tablet {
     int generation;
-    Config state;
+    Config proposed;
     Config commit;
     int timer = 0;
 }
@@ -33,7 +33,8 @@ typedef Tablet {
 Tablet bsc_tablet;
 Tablet console_tablet;
 
-mtype = {grpc_request, init_commit, init_commit_ack, init_commit_fail, commit_request, commit_response, question, question_ack, grpc_response, abort_request, abort_response};
+mtype = {grpc_request, validate_request, validate_response_ok, validate_response_fail, commit_request, commit_response, 
+grpc_response, make_connection};
 
 typedef Message {
     Config config;
@@ -46,6 +47,8 @@ chan pipe_bsc_to_console = [3] of {Message};
 chan pipe_console_to_bsc = [3] of {Message};
 chan pipe_bsc_to_grpc_proxy = [3] of {Message};
 
+bool bsc_ended_work = false;
+
 proctype grpc_proxy() {
     Message msg;
     msg.config.version = 1;
@@ -55,84 +58,125 @@ proctype grpc_proxy() {
 
 proctype bsc() {
     Message msg;
+    bool answered_grpc = false;
 bsc_start:
     do
     :: pipe_grpc_proxy_to_bsc?msg -> 
         if
-        :: msg.config.version == bsc_tablet.state.version ->
-            assign_config(bsc_tablet.state, msg.config);
-            msg.type = init_commit;
-            pipe_bsc_to_grpc_proxy!msg;
+        :: msg.config.version > bsc_tablet.commit.version ->
+            assign_config(bsc_tablet.proposed, msg.config);
+            printf("BSC: assign proposed from grpc proxy %d\n", bsc_tablet.proposed.version);
+            msg.type = validate_request;
+            pipe_bsc_to_console!msg;
+        fi
     :: pipe_console_to_bsc?msg -> 
         if
-        :: msg.type == init_commit_ack->
-            assign_config(bsc_tablet.commit, msg.config);
-            msg.type = commit_request;
-            pipe_bsc_to_console!msg;
+        :: msg.type == make_connection ->
+            if
+            :: bsc_tablet.commit.version > 0 ->
+                msg.type = commit_request;
+                pipe_bsc_to_console!msg;
+            :: else ->
+                skip;
+            fi
+        :: msg.type == validate_response_ok ->
+            if
+            :: bsc_tablet.proposed.version == msg.config.version ->
+                assign_config(bsc_tablet.commit, bsc_tablet.proposed);
+                printf("BSC: assign commit from proposed after validate ok %d\n", bsc_tablet.commit.version);
+                invalidate_config(bsc_tablet.proposed);
+                msg.type = commit_request;
+                pipe_bsc_to_console!msg;
+                msg.type = grpc_response;
+                pipe_bsc_to_grpc_proxy!msg;
+                answered_grpc = true;
+            :: else ->
+                skip;
+            fi
+        :: msg.type == validate_response_fail ->
+            invalidate_config(bsc_tablet.proposed);
+            printf("BSC: invalidate proposed after validate fail %d\n", bsc_tablet.proposed.version);
             msg.type = grpc_response;
             pipe_bsc_to_grpc_proxy!msg;
-        :: msg.type == init_commit_fail ->
-            invalidate_config(bsc_tablet.state);
-            msg.type = grpc_response;
-            pipe_bsc_to_grpc_proxy!msg;
+            answered_grpc = true;
             break;
         :: msg.type == commit_response ->
             break;
-        :: msg.type == question && msg.config.version == bsc_tablet.commit.version ->
-            msg.type = commit_request;
-            pipe_bsc_to_console!msg;
-        :: msg.type == question && msg.config.version != bsc_tablet.commit.version ->
-            msg.type = abort_request;
-            pipe_bsc_to_console!msg;
-        :: msg.type == abort_response ->
-            break;
         fi
-    :: true -> // dead
-       invalidate_config(bsc_tablet.state);
-       msg.type = grpc_response;
-       pipe_bsc_to_grpc_proxy!msg;
     :: bsc_tablet.timer < TIMEOUT ->
         bsc_tablet.timer = bsc_tablet.timer + 1;
-    :: bsc_tablet.timer >= TIMEOUT ->
-        invalidate_config(bsc_tablet.state);
+    :: bsc_tablet.timer >= TIMEOUT && !answered_grpc ->
+        invalidate_config(bsc_tablet.proposed);
+        printf("BSC: invalidate proposed after timeout %d\n", bsc_tablet.proposed.version);
         msg.type = grpc_response;
         pipe_bsc_to_grpc_proxy!msg;
+        answered_grpc = true;
+    :: true -> // dead
+        invalidate_config(bsc_tablet.proposed);
+        printf("BSC: invalidate proposed after dead %d\n", bsc_tablet.proposed.version);
+        if
+        :: !answered_grpc ->
+            msg.type = grpc_response;
+            pipe_bsc_to_grpc_proxy!msg;
+            answered_grpc = true;
+        :: else ->
+            skip;
+        fi
     od
+    bsc_ended_work = true;
 }
 
 proctype console() {
     Message msg;
 console_start:
-    if
-    :: console_tablet.state.version != -1 ->
-        msg.type = question;
-        pipe_console_to_bsc!msg;
-    :: else ->
-        skip;
-    fi
+    msg.type = make_connection
+    pipe_console_to_bsc!msg;
     do
     :: pipe_bsc_to_console?msg ->
         if
-        :: msg.type == init_commit ->
+        :: msg.type == validate_request ->
             try_harakiri(console_tablet, console_start);
-            assign_config(console_tablet.state, msg.config);
+            assign_config(console_tablet.proposed, msg.config);
+            printf("CONSOLE: assign proposed from bsc %d\n", console_tablet.proposed.version);
             try_harakiri(console_tablet, console_start);
-            msg.type = init_commit_ack;
+            if
+            :: true ->
+                msg.type = validate_response_ok;
+            :: true ->
+                msg.type = validate_response_fail;
+                invalidate_config(console_tablet.proposed);
+                printf("CONSOLE: invalidate proposed %d\n", console_tablet.proposed.version);
+            fi
             pipe_console_to_bsc!msg;
             try_harakiri(console_tablet, console_start);
         :: msg.type == commit_request ->
             try_harakiri(console_tablet, console_start);
-            assign_config(console_tablet., msg.config);
+            assign_config(console_tablet.commit, msg.config);
+            printf("CONSOLE: assign commit from bsc %d\n", console_tablet.commit.version);
+            invalidate_config(console_tablet.proposed);
+            printf("CONSOLE: invalidate proposed %d\n", console_tablet.proposed.version);
             try_harakiri(console_tablet, console_start);
             msg.type = commit_response;
             pipe_console_to_bsc!msg;
         fi
+    :: bsc_ended_work ->
+        break;
     od
     skip;
 }
 
 init {
-    invalidate_config(bsc_tablet.state);
-    invalidate_config(console_tablet.state);
+    invalidate_config(bsc_tablet.proposed);
+    invalidate_config(console_tablet.proposed);
+    atomic {
+        run grpc_proxy();
+        run bsc();
+        run console();
+    }
     skip;
+}
+
+
+ltl proof_of_work {
+    [] (bsc_ended_work -> <>(bsc_tablet.commit.version == console_tablet.commit.version && bsc_tablet.proposed.version == -1 && console_tablet.proposed.version == -1));
 }
